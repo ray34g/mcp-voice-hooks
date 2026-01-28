@@ -16,27 +16,14 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Constants
 const WAIT_TIMEOUT_SECONDS = 60;
 const HTTP_PORT = process.env.MCP_VOICE_HOOKS_PORT ? parseInt(process.env.MCP_VOICE_HOOKS_PORT) : 5111;
-
-// Promisified exec for async/await
-const execAsync = promisify(exec);
-
-// Function to play a sound notification
-async function playNotificationSound() {
-  try {
-    // Use macOS system sound
-    await execAsync('afplay /System/Library/Sounds/Funk.aiff');
-    debugLog('[Sound] Played notification sound');
-  } catch (error) {
-    debugLog(`[Sound] Failed to play sound: ${error}`);
-    // Don't throw - sound is not critical
-  }
-}
 
 // Shared utterance queue
 interface Utterance {
@@ -599,7 +586,7 @@ app.get('/api/tts-events', (_req: Request, res: Response) => {
   // Remove client on disconnect
   res.on('close', () => {
     ttsClients.delete(res);
-    
+
     // If no clients remain, disable voice features
     if (ttsClients.size === 0) {
       debugLog('[SSE] Last browser disconnected, disabling voice features');
@@ -773,6 +760,28 @@ app.get('/messenger', (_req: Request, res: Response) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
+
+// transportの切り替え用（上の方に追加）
+type McpTransportMode = 'stdio' | 'http';
+const MCP_TRANSPORT: McpTransportMode =
+  (process.env.MCP_VOICE_HOOKS_MCP_TRANSPORT as McpTransportMode) ??
+  (IS_MCP_MANAGED ? 'stdio' : 'http');
+
+// Promisified exec for async/await
+const execAsync = promisify(exec);
+
+// Function to play a sound notification
+async function playNotificationSound() {
+  try {
+    // Use macOS system sound
+    await execAsync('afplay /System/Library/Sounds/Funk.aiff');
+    debugLog('[Sound] Played notification sound');
+  } catch (error) {
+    debugLog(`[Sound] Failed to play sound: ${error}`);
+    // Don't throw - sound is not critical
+  }
+}
+
 // Start HTTP server
 app.listen(HTTP_PORT, async () => {
   if (!IS_MCP_MANAGED) {
@@ -812,114 +821,97 @@ function getVoiceResponseReminder(): string {
     : '';
 }
 
-// MCP Server Setup (only if MCP-managed)
-if (IS_MCP_MANAGED) {
-  // Use stderr in MCP mode to avoid interfering with protocol
-  console.error('[MCP] Initializing MCP server...');
+function createMcpServer() {
 
   const mcpServer = new Server(
-    {
-      name: 'voice-hooks',
-      version: '1.0.0',
-    },
-    {
-      capabilities: {
-        tools: {},
-      },
-    }
+    { name: 'voice-hooks', version: '1.0.0' },
+    { capabilities: { tools: {} } }
   );
 
-  // Tool handlers
-  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-    // Only expose the speak tool - voice input is auto-delivered via hooks
-    return {
-      tools: [
-        {
-          name: 'speak',
-          description: 'Speak text using text-to-speech and mark delivered utterances as responded',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              text: {
-                type: 'string',
-                description: 'The text to speak',
-              },
-            },
-            required: ['text'],
-          },
-        }
-      ]
-    };
-  });
+  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: 'speak',
+        description: 'Speak text using text-to-speech and mark delivered utterances as responded',
+        inputSchema: {
+          type: 'object',
+          properties: { text: { type: 'string' } },
+          required: ['text'],
+        },
+      },
+    ],
+  }));
 
   mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
+    if (name !== 'speak') {
+      return { content: [{ type: 'text', text: `Error: Unknown tool: ${name}` }], isError: true };
+    }
+
+    const text = (args?.text as string) ?? '';
+    if (!text.trim()) {
+      return { content: [{ type: 'text', text: 'Error: Text is required for speak tool' }], isError: true };
+    }
+
+    // 既存のHTTP APIを叩く（同一プロセス内だが差分が小さい）
+    const response = await fetch(`http://127.0.0.1:${HTTP_PORT}/api/speak`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+
+    const data = (await response.json()) as any;
+    if (!response.ok) {
+      return { content: [{ type: 'text', text: `Error speaking text: ${data.error || 'Unknown error'}` }], isError: true };
+    }
+
+    return { content: [{ type: 'text', text: '' }] };
+  });
+
+  return mcpServer;
+}
+
+
+let httpMcpTransport: StreamableHTTPServerTransport | null = null;
+
+if (MCP_TRANSPORT === 'http') {
+  const mcpServer = createMcpServer();
+
+  httpMcpTransport = new StreamableHTTPServerTransport({
+    // ステートレス運用：sessionIdGenerator を undefined
+    sessionIdGenerator: undefined,
+  });
+
+  // connect は1回
+  await mcpServer.connect(httpMcpTransport);
+
+  app.post('/mcp', async (req, res) => {
     try {
-      if (name === 'speak') {
-        const text = args?.text as string;
-
-        if (!text || !text.trim()) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: 'Error: Text is required for speak tool',
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        const response = await fetch(`http://localhost:${HTTP_PORT}/api/speak`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
-        });
-
-        const data = await response.json() as any;
-
-        if (response.ok) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: '',  // Return empty string for success
-              },
-            ],
-          };
-        } else {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Error speaking text: ${data.error || 'Unknown error'}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      throw new Error(`Unknown tool: ${name}`);
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-        isError: true,
-      };
+      await httpMcpTransport!.handleRequest(req, res, req.body);
+    } catch (e) {
+      if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null });
     }
   });
+
+  // 互換のため GET/DELETE は 405 を返す（ステートレスならこれでOK）:contentReference[oaicite:2]{index=2}
+  app.get('/mcp', (_req, res) => res.status(405).end());
+  app.delete('/mcp', (_req, res) => res.status(405).end());
+}
+
+// MCP Server Setup (only if MCP-managed)
+if (MCP_TRANSPORT === 'stdio') {
+  if (IS_MCP_MANAGED) {
+  // Use stderr in MCP mode to avoid interfering with protocol
+  console.error('[MCP] Initializing MCP server...');
+  const mcpServer = createMcpServer();
 
   // Connect via stdio
   const transport = new StdioServerTransport();
   mcpServer.connect(transport);
   // Use stderr in MCP mode to avoid interfering with protocol
   console.error('[MCP] Server connected via stdio');
+  }
 } else {
   // Only log in standalone mode
   if (!IS_MCP_MANAGED) {
