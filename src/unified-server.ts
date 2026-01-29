@@ -24,6 +24,8 @@ const __dirname = path.dirname(__filename);
 // Constants
 const WAIT_TIMEOUT_SECONDS = 60;
 const HTTP_PORT = process.env.MCP_VOICE_HOOKS_PORT ? parseInt(process.env.MCP_VOICE_HOOKS_PORT) : 5111;
+const HTTP_HOST = process.env.MCP_VOICE_HOOKS_HOST ? process.env.MCP_VOICE_HOOKS_HOST : "localhost";
+const EXTERNAL_URL = process.env.EXTERNAL_URL ? process.env.EXTERNAL_URL : "http://"+HTTP_HOST+":"+HTTP_PORT;
 
 // Shared utterance queue
 interface Utterance {
@@ -802,7 +804,7 @@ app.listen(HTTP_PORT, async () => {
         try {
           const open = (await import('open')).default;
           // Open default UI (messenger is now at root)
-          await open(`http://localhost:${HTTP_PORT}`);
+          await open(`${EXTERNAL_URL}`);
         } catch (error) {
           debugLog('[Browser] Failed to open browser:', error);
         }
@@ -855,7 +857,7 @@ function createMcpServer() {
     }
 
     // 既存のHTTP APIを叩く（同一プロセス内だが差分が小さい）
-    const response = await fetch(`http://127.0.0.1:${HTTP_PORT}/api/speak`, {
+    const response = await fetch(`http://${HTTP_HOST}:${HTTP_PORT}/api/speak`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
