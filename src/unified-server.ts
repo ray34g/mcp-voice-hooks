@@ -661,20 +661,17 @@ app.post('/api/voice-input-state', (req: Request, res: Response) => {
 // API for text-to-speech
 app.post('/api/speak', async (req: Request, res: Response) => {
   const { text } = req.body;
+  const r = await speakCore(text);
+  res.status(r.status).json(r.body);
+});
 
+async function speakCore(text: string) {
   if (!text || !text.trim()) {
-    res.status(400).json({ error: 'Text is required' });
-    return;
+    return { ok: false as const, status: 400, body: { error: 'Text is required' } };
   }
 
-  // Check if voice responses are enabled
   if (!voicePreferences.voiceResponsesEnabled) {
-    debugLog(`[Speak] Voice responses disabled, returning error`);
-    res.status(400).json({
-      error: 'Voice responses are disabled',
-      message: 'Cannot speak when voice responses are disabled'
-    });
-    return;
+    return { ok: false as const, status: 400, body: { error: 'Voice responses are disabled' } };
   }
 
   try {
@@ -701,20 +698,13 @@ app.post('/api/speak', async (req: Request, res: Response) => {
     });
 
     lastSpeakTimestamp = new Date();
+    return { ok: true as const, status: 200, body: { success: true, respondedCount: deliveredUtterances.length } };
 
-    res.json({
-      success: true,
-      message: 'Text spoken successfully',
-      respondedCount: deliveredUtterances.length
-    });
   } catch (error) {
     debugLog(`[Speak] Failed to speak text: ${error}`);
-    res.status(500).json({
-      error: 'Failed to speak text',
-      details: error instanceof Error ? error.message : String(error)
-    });
+    return { ok: false as const, status: 500, body: { error: 'Failed to speak text', details: error instanceof Error ? error.message : String(error) } };
   }
-});
+}
 
 // API for system text-to-speech (always uses Mac say command)
 app.post('/api/speak-system', async (req: Request, res: Response) => {
@@ -846,26 +836,15 @@ function createMcpServer() {
 
   mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-
     if (name !== 'speak') {
       return { content: [{ type: 'text', text: `Error: Unknown tool: ${name}` }], isError: true };
     }
 
     const text = (args?.text as string) ?? '';
-    if (!text.trim()) {
-      return { content: [{ type: 'text', text: 'Error: Text is required for speak tool' }], isError: true };
-    }
+    const r = await speakCore(text);
 
-    // 既存のHTTP APIを叩く（同一プロセス内だが差分が小さい）
-    const response = await fetch(`http://${HTTP_HOST}:${HTTP_PORT}/api/speak`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
-
-    const data = (await response.json()) as any;
-    if (!response.ok) {
-      return { content: [{ type: 'text', text: `Error speaking text: ${data.error || 'Unknown error'}` }], isError: true };
+    if (!r.ok) {
+      return { content: [{ type: 'text', text: `Error speaking text: ${r.body.error || 'Unknown error'}` }], isError: true };
     }
 
     return { content: [{ type: 'text', text: '' }] };
