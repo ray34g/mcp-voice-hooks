@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  workspace:
+
+    build:
+      context: ${LOCAL_WORKSPACE_ROOT:-..}
+      dockerfile: .devcontainer/dev.Dockerfile
+
+    command: ["bash","-lc","sleep infinity"]
+
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    userns_mode: "keep-id"
+
+    volumes:
+      - ${LOCAL_WORKSPACE_ROOT:-..}:/workspaces/${LOCAL_WORKSPACE_BASENAME:-workspace}:Z
+      
+    working_dir: /workspaces/${LOCAL_WORKSPACE_BASENAME:-workspace}
