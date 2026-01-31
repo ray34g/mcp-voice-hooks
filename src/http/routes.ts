@@ -3,7 +3,7 @@ import type { Request, Response } from "express";
 import cors from "cors";
 import path from "path";
 import { debugLog } from "../debug.ts";
-import { __dirname, USE_LEGACY_UI } from "../config.ts";
+import { config } from "../config.ts";
 import type { UtteranceQueue } from "../core/queue.ts";
 import type { SseHub, VoicePreferences } from "../core/voice.ts";
 import { speakCore, speakSystemMac } from "../core/voice.ts";
@@ -38,7 +38,7 @@ export function createApp(args: {
   const app = express();
   app.use(cors());
   app.use(express.json());
-  app.use(express.static(path.join(__dirname, "..", "public")));
+  app.use(express.static(path.join(config.paths.dirname, "..", "public")));
 
   // ---- API: utterances ----
   app.post("/api/potential-utterances", (req: Request, res: Response) => {
@@ -227,17 +227,17 @@ export function createApp(args: {
 
   // ---- UI routing ----
   app.get("/", (_req, res) => {
-    const htmlFile = USE_LEGACY_UI ? "legacy.html" : "index.html";
+    const htmlFile = config.ui.useLegacy ? "legacy.html" : "index.html";
     debugLog(`[HTTP] Serving ${htmlFile} for root route`);
-    res.sendFile(path.join(__dirname, "..", "public", htmlFile));
+    res.sendFile(path.join(config.paths.dirname, "..", "public", htmlFile));
   });
 
   app.get("/legacy", (_req, res) => {
-    res.sendFile(path.join(__dirname, "..", "public", "legacy.html"));
+    res.sendFile(path.join(config.paths.dirname, "..", "public", "legacy.html"));
   });
 
   app.get("/messenger", (_req, res) => {
-    res.sendFile(path.join(__dirname, "..", "public", "index.html"));
+    res.sendFile(path.join(config.paths.dirname, "..", "public", "index.html"));
   });
 
   return app;

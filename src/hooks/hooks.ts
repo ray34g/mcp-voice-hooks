@@ -2,7 +2,7 @@ import { debugLog } from "../debug.ts";
 import type { UtteranceQueue } from "../core/queue.ts";
 import type { SseHub, VoicePreferences } from "../core/voice.ts";
 import { playNotificationSound, getVoiceResponseReminder } from "../core/voice.ts";
-import { WAIT_TIMEOUT_SECONDS } from "../config.ts";
+import { config } from "../config.ts";
 
 export function dequeueUtterancesCore(queue: UtteranceQueue) {
   const pending = queue.utterances
@@ -32,9 +32,9 @@ export async function waitForUtteranceCore(args: {
     };
   }
 
-  const maxWaitMs = WAIT_TIMEOUT_SECONDS * 1000;
+  const maxWaitMs = config.timeouts.waitSeconds * 1000;
   const startTime = Date.now();
-  debugLog(`[WaitCore] Starting wait_for_utterance (${WAIT_TIMEOUT_SECONDS}s)`);
+  debugLog(`[WaitCore] Starting wait_for_utterance (${config.timeouts.waitSeconds}s)`);
 
   sse.notifyWaitStatus(true);
 
@@ -85,7 +85,7 @@ export async function waitForUtteranceCore(args: {
   return {
     success: true,
     utterances: [],
-    message: `No utterances found after waiting ${WAIT_TIMEOUT_SECONDS} seconds.`,
+    message: `No utterances found after waiting ${config.timeouts.waitSeconds} seconds.`,
     waitTime: maxWaitMs,
   };
 }
