@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { debugLog } from "../debug.ts";
+import { debugLog } from "../runtime/debugLogger.ts";
 
 interface Utterance {
   id: string;
@@ -17,8 +17,8 @@ interface ConversationMessage {
 }
 
 export class UtteranceQueue {
-  utterances: Utterance[] = [];
-  messages: ConversationMessage[] = [];
+  private utterances: Utterance[] = [];
+  private messages: ConversationMessage[] = [];
 
   add(text: string, timestamp?: Date): Utterance {
     const utterance: Utterance = {
@@ -99,6 +99,49 @@ export class UtteranceQueue {
 
     debugLog(`[Queue] Deleted pending message: "${u.text}"\t[id: ${id}]`);
     return true;
+  }
+  
+  getPendingUtterances(): Utterance[] {
+    return this.utterances.filter((u) => u.status === "pending");
+  }
+
+  getDeliveredUtterances(): Utterance[] {
+    return this.utterances.filter((u) => u.status === "delivered");
+  }
+
+  getPendingUtterancesOldestFirst(): Utterance[] {
+    return this.getPendingUtterances()
+      .slice()
+      .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+  }
+
+  getCounts(): { total: number; pending: number; delivered: number } {
+    const total = this.utterances.length;
+    let pending = 0;
+    let delivered = 0;
+    for (const u of this.utterances) {
+      if (u.status === "pending") pending++;
+      else if (u.status === "delivered") delivered++;
+    }
+    return { total, pending, delivered };
+  }
+  
+  dequeuePendingNewestFirst(): Array<{ id: string; text: string; timestamp: Date }> {
+    const pending = this.getPendingUtterances()
+      .slice()
+      .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+    pending.forEach((u) => this.markDelivered(u.id));
+
+    return pending.map((u) => ({ id: u.id, text: u.text, timestamp: u.timestamp }));
+  }
+
+  getTotalUtterancesCount(): number {
+    return this.utterances.length;
+  }
+
+  hasAnyUtterances(): boolean {
+    return this.utterances.length > 0;
   }
 
   clear(): void {

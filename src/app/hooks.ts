@@ -1,28 +1,33 @@
-import { debugLog } from "../debug.ts";
+// src/hooks/hooks.ts
+import { debugLog } from "../runtime/debugLogger.ts";
 import type { UtteranceQueue } from "../core/queue.ts";
-import type { SseHub, VoicePreferences } from "../core/voice.ts";
-import { playNotificationSound, getVoiceResponseReminder } from "../core/voice.ts";
-import { config } from "../config.ts";
+import type { VoicePreferences } from "../core/voice.ts";
+import { getVoiceResponseReminder } from "./messages/voice.ts";
+import { playNotificationSound as defaultPlayNotificationSound } from "../adapters/tts/macos.ts";
+import { config } from "../runtime/config.ts";
 
 export function dequeueUtterancesCore(queue: UtteranceQueue) {
-  const pending = queue.utterances
-    .filter((u) => u.status === "pending")
-    .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
-
-  pending.forEach((u) => queue.markDelivered(u.id));
-
+  const utterances = queue.dequeuePendingNewestFirst();
   return {
     success: true,
-    utterances: pending.map((u) => ({ text: u.text, timestamp: u.timestamp })),
+    utterances: utterances.map(({ text, timestamp }) => ({ text, timestamp })),
   };
 }
 
 export async function waitForUtteranceCore(args: {
   queue: UtteranceQueue;
   prefs: VoicePreferences;
-  sse: SseHub;
+  notifyWaitStatus: (isWaiting: boolean) => void;
+  playNotificationSound?: () => Promise<void>;
+  sleepMs?: number; // for testing
 }) {
-  const { queue, prefs, sse } = args;
+  const {
+    queue,
+    prefs,
+    notifyWaitStatus,
+    playNotificationSound,
+    sleepMs,
+  } = args;
 
   if (!prefs.voiceInputActive) {
     return {
@@ -31,19 +36,25 @@ export async function waitForUtteranceCore(args: {
         "Voice input is not active. Cannot wait for utterances when voice input is disabled.",
     };
   }
-
+  
   const maxWaitMs = config.timeouts.waitSeconds * 1000;
   const startTime = Date.now();
-  debugLog(`[WaitCore] Starting wait_for_utterance (${config.timeouts.waitSeconds}s)`);
+  debugLog(
+    `[WaitCore] Starting wait_for_utterance (${config.timeouts.waitSeconds}s)`
+  );
 
-  sse.notifyWaitStatus(true);
+  notifyWaitStatus(true);
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const doPlaySound = playNotificationSound ?? defaultPlayNotificationSound;
+  const pollMs = sleepMs ?? 100;
 
   let firstTime = true;
 
   while (Date.now() - startTime < maxWaitMs) {
     if (!prefs.voiceInputActive) {
       debugLog("[WaitCore] Voice input deactivated during wait_for_utterance");
-      sse.notifyWaitStatus(false);
+      notifyWaitStatus(false);
       return {
         success: true,
         utterances: [],
@@ -52,14 +63,12 @@ export async function waitForUtteranceCore(args: {
       };
     }
 
-    const pending = queue.utterances.filter((u) => u.status === "pending");
+    const pending = queue.getPendingUtterances();
     if (pending.length > 0) {
-      const sortedOldestFirst = pending.sort(
-        (a, b) => a.timestamp.getTime() - b.timestamp.getTime()
-      );
+      const sortedOldestFirst = queue.getPendingUtterancesOldestFirst();
       sortedOldestFirst.forEach((u) => queue.markDelivered(u.id));
 
-      sse.notifyWaitStatus(false);
+      notifyWaitStatus(false);
       return {
         success: true,
         utterances: sortedOldestFirst.map((u) => ({
@@ -75,13 +84,17 @@ export async function waitForUtteranceCore(args: {
 
     if (firstTime) {
       firstTime = false;
-      await playNotificationSound();
+      try {
+        await doPlaySound();
+      } catch (e) {
+        debugLog(`[WaitCore] Failed to play notification sound: ${e}`);
+      }
     }
 
-    await new Promise((r) => setTimeout(r, 100));
+    await sleep(pollMs);
   }
 
-  sse.notifyWaitStatus(false);
+  notifyWaitStatus(false);
   return {
     success: true,
     utterances: [],
@@ -98,11 +111,14 @@ export function validateAction(args: {
   const { action, queue, prefs } = args;
 
   if (!action || !["tool-use", "stop"].includes(String(action))) {
-    return { status: 400 as const, body: { error: 'Invalid action. Must be "tool-use" or "stop"' } };
+    return {
+      status: 400 as const,
+      body: { error: 'Invalid action. Must be "tool-use" or "stop"' },
+    };
   }
 
   if (prefs.voiceInputActive) {
-    const pending = queue.utterances.filter((u) => u.status === "pending");
+    const pending = queue.getPendingUtterances();
     if (pending.length > 0) {
       return {
         status: 200 as const,
@@ -116,7 +132,7 @@ export function validateAction(args: {
   }
 
   if (prefs.voiceResponsesEnabled) {
-    const delivered = queue.utterances.filter((u) => u.status === "delivered");
+    const delivered = queue.getDeliveredUtterances();
     if (delivered.length > 0) {
       return {
         status: 200 as const,
@@ -130,7 +146,7 @@ export function validateAction(args: {
   }
 
   if (String(action) === "stop" && prefs.voiceInputActive) {
-    if (queue.utterances.length > 0) {
+    if (queue.getCounts().total > 0) {
       return {
         status: 200 as const,
         body: {
@@ -146,7 +162,10 @@ export function validateAction(args: {
   return { status: 200 as const, body: { allowed: true } };
 }
 
-function formatVoiceUtterances(utterances: Array<{ text: string }>, prefs: VoicePreferences) {
+function formatVoiceUtterances(
+  utterances: Array<{ text: string }>,
+  prefs: VoicePreferences
+) {
   const utteranceTexts = utterances.map((u) => `"${u.text}"`).join("\n");
   return `Assistant received voice input from the user (${utterances.length} utterance${
     utterances.length !== 1 ? "s" : ""
@@ -156,7 +175,13 @@ function formatVoiceUtterances(utterances: Array<{ text: string }>, prefs: Voice
 export function createHookHandler(args: {
   queue: UtteranceQueue;
   prefs: VoicePreferences;
-  sse: SseHub;
+
+  notifyWaitStatus: (isWaiting: boolean) => void;
+
+  // 任意（テストや環境差分のため）
+  playNotificationSound?: () => Promise<void>;
+  sleepMs?: number;
+
   getLastToolUseTimestamp: () => Date | null;
   getLastSpeakTimestamp: () => Date | null;
   setLastToolUseTimestamp: (d: Date) => void;
@@ -164,7 +189,9 @@ export function createHookHandler(args: {
   const {
     queue,
     prefs,
-    sse,
+    notifyWaitStatus,
+    playNotificationSound,
+    sleepMs,
     getLastToolUseTimestamp,
     getLastSpeakTimestamp,
     setLastToolUseTimestamp,
@@ -176,7 +203,7 @@ export function createHookHandler(args: {
     | { decision: "approve" | "block"; reason?: string }
     | Promise<{ decision: "approve" | "block"; reason?: string }> {
     // 1) pending は常に dequeue（typed/voice 両対応）
-    const pending = queue.utterances.filter((u) => u.status === "pending");
+    const pending = queue.getPendingUtterances();
     if (pending.length > 0) {
       const dequeueResult = dequeueUtterancesCore(queue);
       if (dequeueResult.utterances?.length) {
@@ -190,7 +217,7 @@ export function createHookHandler(args: {
 
     // 2) voice enabled 時、delivered があるなら speak 以外ブロック
     if (prefs.voiceResponsesEnabled) {
-      const delivered = queue.utterances.filter((u) => u.status === "delivered");
+      const delivered = queue.getDeliveredUtterances();
       if (delivered.length > 0) {
         if (attemptedAction === "speak") return { decision: "approve" };
         return {
@@ -215,7 +242,8 @@ export function createHookHandler(args: {
         prefs.voiceResponsesEnabled &&
         getLastToolUseTimestamp() &&
         (!getLastSpeakTimestamp() ||
-          (getLastSpeakTimestamp() as Date) < (getLastToolUseTimestamp() as Date))
+          (getLastSpeakTimestamp() as Date) <
+            (getLastToolUseTimestamp() as Date))
       ) {
         return {
           decision: "block",
@@ -228,17 +256,30 @@ export function createHookHandler(args: {
         return (async () => {
           try {
             debugLog(`[Stop Hook] Auto-calling wait_for_utterance...`);
-            const data = await waitForUtteranceCore({ queue, prefs, sse });
-            debugLog(`[Stop Hook] wait_for_utterance response: ${JSON.stringify(data)}`);
+
+            const data = await waitForUtteranceCore({
+              queue,
+              prefs,
+              notifyWaitStatus,
+              playNotificationSound,
+              sleepMs,
+            });
+
+            debugLog(
+              `[Stop Hook] wait_for_utterance response: ${JSON.stringify(data)}`
+            );
 
             if (!data.success && (data as any).error) {
-              return { decision: "approve" as const, reason: (data as any).error };
+              return {
+                decision: "approve" as const,
+                reason: (data as any).error,
+              };
             }
 
-            if (data.utterances?.length) {
+            if ((data as any).utterances?.length) {
               return {
                 decision: "block" as const,
-                reason: formatVoiceUtterances(data.utterances as any, prefs),
+                reason: formatVoiceUtterances((data as any).utterances, prefs),
               };
             }
 

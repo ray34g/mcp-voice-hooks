@@ -2,24 +2,29 @@ import express from "express";
 import type { Request, Response } from "express";
 import cors from "cors";
 import path from "path";
-import { debugLog } from "../debug.ts";
-import { config } from "../config.ts";
+import { debugLog } from "../runtime/debugLogger.ts";
+import { config } from "../runtime/config.ts";
 import type { UtteranceQueue } from "../core/queue.ts";
-import type { SseHub, VoicePreferences } from "../core/voice.ts";
-import { speakCore, speakSystemMac } from "../core/voice.ts";
+import type { SseController, SseNotifiers } from "./sseTypes.ts";
+import type { VoicePreferences } from "../core/voice.ts";
+import { speakCore  } from "../core/voice.ts";
+import { speakSystemMac, playNotificationSound } from "../adapters/tts/macos.ts";
 import {
   dequeueUtterancesCore,
   waitForUtteranceCore,
   validateAction,
   createHookHandler,
-} from "../hooks/hooks.ts";
+} from "../app/hooks.ts";
 
 export function createApp(args: {
   queue: UtteranceQueue;
   prefs: VoicePreferences;
-  sse: SseHub;
+  sseController: SseController;
+  notify: SseNotifiers;
+
   getLastToolUseTimestamp: () => Date | null;
   getLastSpeakTimestamp: () => Date | null;
+
   setLastToolUseTimestamp: (d: Date) => void;
   setLastSpeakTimestamp: (d: Date) => void;
   onLastBrowserDisconnected: () => void;
@@ -27,7 +32,8 @@ export function createApp(args: {
   const {
     queue,
     prefs,
-    sse,
+    sseController,
+    notify,
     getLastToolUseTimestamp,
     getLastSpeakTimestamp,
     setLastToolUseTimestamp,
@@ -88,9 +94,7 @@ export function createApp(args: {
   });
 
   app.get("/api/utterances/status", (_req, res) => {
-    const total = queue.utterances.length;
-    const pending = queue.utterances.filter((u) => u.status === "pending").length;
-    const delivered = queue.utterances.filter((u) => u.status === "delivered").length;
+    const { total, pending, delivered } = queue.getCounts();
     res.json({ total, pending, delivered });
   });
 
@@ -99,7 +103,13 @@ export function createApp(args: {
   });
 
   app.post("/api/wait-for-utterances", async (_req, res) => {
-    const result = await waitForUtteranceCore({ queue, prefs, sse });
+    const result = await waitForUtteranceCore({
+      queue,
+      prefs,
+      notifyWaitStatus: notify.notifyWaitStatus,
+      playNotificationSound,
+      sleepMs: 100,
+    });
     if (!result.success && (result as any).error) {
       res.status(400).json(result);
       return;
@@ -108,7 +118,7 @@ export function createApp(args: {
   });
 
   app.get("/api/has-pending-utterances", (_req, res) => {
-    const pendingCount = queue.utterances.filter((u) => u.status === "pending").length;
+    const pendingCount = queue.getCounts().pending;
     res.json({ hasPending: pendingCount > 0, pendingCount });
   });
 
@@ -121,7 +131,9 @@ export function createApp(args: {
   const handleHookRequest = createHookHandler({
     queue,
     prefs,
-    sse,
+    notifyWaitStatus: notify.notifyWaitStatus,
+    playNotificationSound, // 省略可（デフォルトがあるので）
+    sleepMs: 100,          // 省略可
     getLastToolUseTimestamp,
     getLastSpeakTimestamp,
     setLastToolUseTimestamp,
@@ -148,7 +160,7 @@ export function createApp(args: {
   });
 
   app.delete("/api/utterances", (_req, res) => {
-    const clearedCount = queue.utterances.length;
+    const clearedCount = queue.getTotalUtterancesCount();
     queue.clear();
     res.json({ success: true, message: `Cleared ${clearedCount} utterances`, clearedCount });
   });
@@ -162,11 +174,11 @@ export function createApp(args: {
     });
 
     res.write('data: {"type":"connected"}\n\n');
-    sse.add(res);
+    sseController.addClient(res);
 
     res.on("close", () => {
-      sse.remove(res);
-      if (sse.size() === 0) {
+      sseController.removeClient(res);
+      if (sseController.clientCount() === 0) {
         debugLog("[SSE] Last browser disconnected, disabling voice features");
         if (prefs.voiceInputActive || prefs.voiceResponsesEnabled) {
           prefs.voiceInputActive = false;
@@ -174,7 +186,7 @@ export function createApp(args: {
         }
         onLastBrowserDisconnected();
       } else {
-        debugLog(`[SSE] Browser disconnected, ${sse.size()} client(s) remaining`);
+        debugLog(`[SSE] Browser disconnected, ${sseController.clientCount()} client(s) remaining`);
       }
     });
   });
@@ -198,9 +210,9 @@ export function createApp(args: {
     const r = await speakCore({
       text,
       prefs,
-      sse,
       queue,
       setLastSpeakTimestamp,
+      notifyTts: notify.notifyTts,
     });
     res.status(r.status).json(r.body);
   });
@@ -227,7 +239,7 @@ export function createApp(args: {
 
   // ---- UI routing ----
   app.get("/", (_req, res) => {
-    const htmlFile = config.ui.useLegacy ? "legacy.html" : "index.html";
+    const htmlFile = config.ui.useLegacyUi ? "legacy.html" : "index.html";
     debugLog(`[HTTP] Serving ${htmlFile} for root route`);
     res.sendFile(path.join(config.paths.dirname, "..", "public", htmlFile));
   });

@@ -1,16 +1,30 @@
 #!/usr/bin/env node
 
-import { debugLog } from "./debug.ts";
+import { debugLog } from "./runtime/debugLogger.ts";
 import { UtteranceQueue } from "./core/queue.ts";
-import { SseHub, type VoicePreferences } from "./core/voice.ts";
+import { SseHub } from "./http/sseHub.ts";
+import type { SseController, SseNotifiers } from "./http/sseTypes.ts";
+import type { VoicePreferences } from "./core/voice.ts";
 import { createApp } from "./http/routes.ts";
-import { config } from "./config.ts";
-
-import { createMcpServer, attachHttpMcpEndpoint, connectStdioMcp } from "./mcp/server.ts";
+import { config } from "./runtime/config.ts";
+import { createMcpServer } from "./mcp/server.ts";
+import { attachHttpMcpEndpoint } from "./mcp/httpEndpoint.ts";
+import { connectStdioMcp } from "./mcp/stdio.ts";
 
 export async function main() {
   const queue = new UtteranceQueue();
   const sse = new SseHub();
+
+  const sseController: SseController = {
+    addClient: (res) => sse.add(res),
+    removeClient: (res) => sse.remove(res),
+    clientCount: () => sse.size(),
+  };
+
+  const notify: SseNotifiers = {
+    notifyTts: (text) => sse.notifyTts(text),
+    notifyWaitStatus: (v) => sse.notifyWaitStatus(v),
+  };
 
   const prefs: VoicePreferences = {
     voiceResponsesEnabled: false,
@@ -23,7 +37,8 @@ export async function main() {
   const app = createApp({
     queue,
     prefs,
-    sse,
+    sseController,
+    notify,
     getLastToolUseTimestamp: () => lastToolUseTimestamp,
     getLastSpeakTimestamp: () => lastSpeakTimestamp,
     setLastToolUseTimestamp: (d) => (lastToolUseTimestamp = d),
@@ -33,12 +48,11 @@ export async function main() {
     },
   });
 
-  // MCP
   const mcpServer = createMcpServer({
     prefs,
-    sse,
     queue,
     setLastSpeakTimestamp: (d) => (lastSpeakTimestamp = d),
+    notifyTts: (t) => notify.notifyTts(t), // ← 既存の notify を流用
   });
 
   if (config.mcp.transport === "http") {
@@ -49,7 +63,6 @@ export async function main() {
     console.error("[MCP] Server connected via stdio");
   }
 
-  // HTTP start
   app.listen(config.http.port, async () => {
     const log = config.mcp.isManaged ? console.error : console.log;
     log(`[HTTP] Server listening on http://localhost:${config.http.port}`);
@@ -57,7 +70,7 @@ export async function main() {
 
     if (config.mcp.isManaged && config.ui.autoOpenBrowser) {
       setTimeout(async () => {
-        if (sse.size() === 0) {
+        if (sseController.clientCount() === 0) {
           debugLog("[Browser] No frontend connected, opening browser...");
           try {
             const open = (await import("open")).default;
@@ -66,7 +79,7 @@ export async function main() {
             debugLog("[Browser] Failed to open browser:", e as any);
           }
         } else {
-          debugLog(`[Browser] Frontend already connected (${sse.size()} client(s))`);
+          debugLog(`[Browser] Frontend already connected (${sseController.clientCount()} client(s))`);
         }
       }, 3000);
     }

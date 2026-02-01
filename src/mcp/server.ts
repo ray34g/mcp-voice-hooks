@@ -1,105 +1,73 @@
-import type { Express } from "express";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+// src/mcp/server.ts
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
 
-import type { VoicePreferences, SseHub } from "../core/voice.ts";
+import type { VoicePreferences } from "../core/voice.ts";
 import type { UtteranceQueue } from "../core/queue.ts";
 import { speakCore } from "../core/voice.ts";
 
 export function createMcpServer(args: {
   prefs: VoicePreferences;
-  sse: SseHub;
   queue: UtteranceQueue;
   setLastSpeakTimestamp: (d: Date) => void;
+  notifyTts: (text: string) => void;
 }) {
-  const { prefs, sse, queue, setLastSpeakTimestamp } = args;
+  const { prefs, queue, setLastSpeakTimestamp, notifyTts } = args;
 
-  const mcpServer = new Server(
-    { name: "voice-hooks", version: "1.0.0" },
-    { capabilities: { tools: {} } }
+  const SpeakInputSchema = z
+    .object({ text: z.string() })
+    .strict() as any;
+
+  const server = new McpServer({ name: "voice-hooks", version: "1.0.0" });
+
+  const registerTool = (server as any).registerTool.bind(server) as (
+    name: string,
+    meta: { description?: string; inputSchema: unknown },
+    handler: (raw: unknown) => Promise<{ content: Array<{ type: "text"; text: string }> }>
+  ) => void;
+
+  registerTool(
+    "speak",
+    {
+      description:
+        "Speak text using text-to-speech and mark delivered utterances as responded",
+      inputSchema: SpeakInputSchema,
+    },
+    async (raw: unknown) => {
+      const parsed = (SpeakInputSchema as any).safeParse(raw);
+      if (!parsed.success) {
+        return {
+          content: [{ type: "text", text: "Error: invalid input (expected { text: string })" }],
+        };
+      }
+
+      const text = String(parsed.data.text ?? "").trim();
+      if (!text) {
+        return { content: [{ type: "text", text: "Error speaking text: Text is required" }] };
+      }
+
+      const r = await speakCore({
+        text,
+        prefs,
+        queue,
+        setLastSpeakTimestamp,
+        notifyTts,
+      });
+
+      if (!r.ok) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error speaking text: ${(r.body as any).error || "Unknown error"}`,
+            },
+          ],
+        };
+      }
+
+      return { content: [{ type: "text", text: "" }] };
+    }
   );
 
-  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
-      {
-        name: "speak",
-        description:
-          "Speak text using text-to-speech and mark delivered utterances as responded",
-        inputSchema: {
-          type: "object",
-          properties: { text: { type: "string" } },
-          required: ["text"],
-        },
-      },
-    ],
-  }));
-
-  mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: a } = request.params;
-    if (name !== "speak") {
-      return {
-        content: [{ type: "text", text: `Error: Unknown tool: ${name}` }],
-        isError: true,
-      };
-    }
-
-    const text = String((a as any)?.text ?? "");
-    const r = await speakCore({ text, prefs, sse, queue, setLastSpeakTimestamp });
-
-    if (!r.ok) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error speaking text: ${(r.body as any).error || "Unknown error"}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    return { content: [{ type: "text", text: "" }] };
-  });
-
-  return mcpServer;
-}
-
-export async function attachHttpMcpEndpoint(args: {
-  app: Express;
-  mcpServer: Server;
-}) {
-  const { app, mcpServer } = args;
-
-  const httpMcpTransport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless
-  });
-
-  await mcpServer.connect(httpMcpTransport);
-
-  app.post("/mcp", async (req, res) => {
-    try {
-      await httpMcpTransport.handleRequest(req, res, req.body);
-    } catch {
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal error" },
-          id: null,
-        });
-      }
-    }
-  });
-
-  app.get("/mcp", (_req, res) => res.status(405).end());
-  app.delete("/mcp", (_req, res) => res.status(405).end());
-}
-
-export async function connectStdioMcp(mcpServer: Server) {
-  const transport = new StdioServerTransport();
-  await mcpServer.connect(transport);
+  return server;
 }
